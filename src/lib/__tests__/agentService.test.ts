@@ -241,4 +241,222 @@ describe("CareSync AI Agent Service (OpenRouter Tools)", () => {
     const finalMessage = conversation[conversation.length - 1];
     expect(finalMessage.content).toContain("booked");
   });
+
+  it("should NOT book before the user explicitly confirms the proposed slot", async () => {
+    // 1st Turn: Check availability
+    mockCreateSpy.mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: "call-check",
+                type: "function",
+                function: {
+                  name: "check_availability",
+                  arguments: JSON.stringify({
+                    doctorName: "Dr. Ravi",
+                    date: "2026-08-09",
+                    timePreference: "morning"
+                  })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    });
+
+    // 2nd Turn: Propose slot, ask for confirmation
+    mockCreateSpy.mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: "Dr. Ravi has an opening at 10:30 AM tomorrow. Would you like me to book it?",
+            tool_calls: null
+          }
+        }
+      ]
+    });
+
+    const conversation = await runAgentConversation(
+      [{ role: "user", content: "I want Dr. Ravi tomorrow morning." }],
+      "2026-08-08"
+    );
+
+    expect(mockCreateSpy).toHaveBeenCalledTimes(2);
+
+    // Verify no booking tool call was made
+    const toolMsgs = conversation.filter(m => m.role === "tool");
+    expect(toolMsgs.length).toBe(1);
+    expect(JSON.parse(toolMsgs[0].content || "{}").success).toBe(true);
+
+    // Check database has not mutated
+    const raviSlot = getSchedule().find(
+      s => s.doctorName === "Dr. Ravi" && s.date === "2026-08-09" && s.time === "10:30"
+    );
+    expect(raviSlot?.isBooked).toBe(false);
+
+    const finalMessage = conversation[conversation.length - 1];
+    expect(finalMessage.content).toContain("Would you like me to book it");
+  });
+
+  it("should immediately book if the user expresses explicit booking intent for an available slot", async () => {
+    // 1st Turn: Check availability
+    mockCreateSpy.mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: "call-check",
+                type: "function",
+                function: {
+                  name: "check_availability",
+                  arguments: JSON.stringify({
+                    doctorName: "Dr. Ravi",
+                    date: "2026-08-09",
+                    time: "10:30"
+                  })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    });
+
+    // 2nd Turn: Call book_appointment since slot is available and intent was explicit
+    mockCreateSpy.mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: "call-book",
+                type: "function",
+                function: {
+                  name: "book_appointment",
+                  arguments: JSON.stringify({
+                    doctorName: "Dr. Ravi",
+                    date: "2026-08-09",
+                    time: "10:30"
+                  })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    });
+
+    // 3rd Turn: Return final confirmation
+    mockCreateSpy.mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: "Your appointment with Dr. Ravi is confirmed for tomorrow at 10:30 AM.",
+            tool_calls: null
+          }
+        }
+      ]
+    });
+
+    const conversation = await runAgentConversation(
+      [{ role: "user", content: "Book Dr. Ravi tomorrow at 10:30 AM." }],
+      "2026-08-08"
+    );
+
+    expect(mockCreateSpy).toHaveBeenCalledTimes(3);
+
+    // Verify slot is booked in the database
+    const raviSlot = getSchedule().find(
+      s => s.doctorName === "Dr. Ravi" && s.date === "2026-08-09" && s.time === "10:30"
+    );
+    expect(raviSlot?.isBooked).toBe(true);
+
+    const finalMessage = conversation[conversation.length - 1];
+    expect(finalMessage.content).toContain("confirmed");
+  });
+
+  it("should ask the user naturally if doctor or date is missing", async () => {
+    // Turn 1: AI generates text asking for clarification (no tool calls because info is missing)
+    mockCreateSpy.mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: "Which doctor would you like to see?",
+            tool_calls: null
+          }
+        }
+      ]
+    });
+
+    const conversation = await runAgentConversation(
+      [{ role: "user", content: "I need an appointment tomorrow." }],
+      "2026-08-08"
+    );
+
+    // Verify AI did not call any tools
+    const toolCalls = conversation.filter(m => m.role === "tool");
+    expect(toolCalls.length).toBe(0);
+
+    const finalMessage = conversation[conversation.length - 1];
+    expect(finalMessage.content).toBe("Which doctor would you like to see?");
+  });
+
+  it("should verify mock schedule data is NOT directly modified by AI without engine tools", async () => {
+    // 1st Turn: Find alternative slots call
+    mockCreateSpy.mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: "call-alt",
+                type: "function",
+                function: {
+                  name: "find_alternative_slots",
+                  arguments: JSON.stringify({
+                    doctorName: "Dr. Ravi",
+                    date: "2026-08-09"
+                  })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    });
+
+    // 2nd Turn: Respond with alternatives
+    mockCreateSpy.mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: "Dr. Ravi has slots at 09:00 AM, 10:30 AM, and 11:00 AM.",
+            tool_calls: null
+          }
+        }
+      ]
+    });
+
+    // Get a snapshot of database status before
+    const initialBookings = getSchedule().map(s => s.isBooked);
+
+    await runAgentConversation(
+      [{ role: "user", content: "What alternatives are there for Dr. Ravi?" }],
+      "2026-08-08"
+    );
+
+    // Get a snapshot of database status after
+    const postBookings = getSchedule().map(s => s.isBooked);
+
+    // Verify that checking alternatives did not change any booking state
+    expect(postBookings).toEqual(initialBookings);
+  });
 });
