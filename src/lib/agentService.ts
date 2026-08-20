@@ -112,6 +112,162 @@ export const agentTools = [
   }
 ];
 
+interface MockChoiceMessage {
+  content: string | null;
+  tool_calls?: {
+    id: string;
+    type: "function";
+    function: {
+      name: string;
+      arguments: string;
+    };
+  }[];
+}
+
+/**
+ * Generates local simulated model completion responses when no API key is set.
+ */
+function simulateModelResponse(history: ChatMessage[]): MockChoiceMessage {
+  const lastMsg = history[history.length - 1];
+  
+  if (!lastMsg) {
+    return {
+      content: "I'm CareSync's AI assistant. To book an appointment, try using one of the helper prompts on the right, like \"Book Dr. Ravi\".",
+    };
+  }
+
+  // 1. If the last message is a user message
+  if (lastMsg.role === "user") {
+    const text = (lastMsg.content || "").toLowerCase();
+    
+    // Check for confirmation intent first
+    if (text.includes("yes") || text.includes("book") || text.includes("confirm")) {
+      // Find which doctor was previously proposed
+      const previousProposal = [...history].reverse().find(
+        (m) => m.role === "assistant" && m.content !== null
+      );
+      const isRavi = previousProposal?.content?.includes("Ravi");
+      const isPriya = previousProposal?.content?.includes("Priya");
+      
+      if (isRavi) {
+        return {
+          content: null,
+          tool_calls: [
+            {
+              id: "mock-book-ravi",
+              type: "function",
+              function: {
+                name: "book_appointment",
+                arguments: JSON.stringify({ doctorName: "Dr. Ravi", date: "2026-08-09", time: "10:30" }),
+              },
+            },
+          ],
+        };
+      }
+      
+      if (isPriya) {
+        return {
+          content: null,
+          tool_calls: [
+            {
+              id: "mock-book-priya",
+              type: "function",
+              function: {
+                name: "book_appointment",
+                arguments: JSON.stringify({ doctorName: "Dr. Priya", date: "2026-08-10", time: "09:30" }),
+              },
+            },
+          ],
+        };
+      }
+    }
+    
+    // Check for doctor check intents
+    if (text.includes("ravi")) {
+      return {
+        content: null,
+        tool_calls: [
+          {
+            id: "mock-check-ravi",
+            type: "function",
+            function: {
+              name: "check_availability",
+              arguments: JSON.stringify({ doctorName: "Dr. Ravi", date: "2026-08-09", timePreference: "morning" }),
+            },
+          },
+        ],
+      };
+    }
+    
+    if (text.includes("priya")) {
+      return {
+        content: null,
+        tool_calls: [
+          {
+            id: "mock-check-priya",
+            type: "function",
+            function: {
+              name: "check_availability",
+              arguments: JSON.stringify({ doctorName: "Dr. Priya", date: "2026-08-10", timePreference: "morning" }),
+            },
+          },
+        ],
+      };
+    }
+
+    return {
+      content: "I'm CareSync's AI assistant. To book an appointment, try using one of the helper prompts on the right, like \"Book Dr. Ravi\".",
+    };
+  }
+
+  // 2. If the last message is a tool response
+  if (lastMsg.role === "tool") {
+    const callId = lastMsg.tool_call_id;
+    let toolResult: { success?: boolean; available?: boolean; booking?: { doctorName: string; date: string; time: string } } = {};
+    try {
+      toolResult = JSON.parse(lastMsg.content || "{}");
+    } catch {
+      // Ignore JSON parse errors
+    }
+    
+    if (callId?.startsWith("mock-check-ravi")) {
+      if (toolResult.success && toolResult.available) {
+        return {
+          content: "Dr. Ravi has an opening at 10:30 AM tomorrow. Would you like me to book it?",
+        };
+      }
+    }
+    
+    if (callId?.startsWith("mock-check-priya")) {
+      if (toolResult.success && toolResult.available) {
+        return {
+          content: "Dr. Priya has an opening at 09:30 AM next Monday. Would you like me to book it?",
+        };
+      }
+    }
+    
+    if (callId?.startsWith("mock-book-ravi")) {
+      if (toolResult.success) {
+        return {
+          content: "Your appointment with Dr. Ravi is confirmed for 10:30 AM tomorrow.",
+        };
+      }
+    }
+    
+    if (callId?.startsWith("mock-book-priya")) {
+      if (toolResult.success) {
+        return {
+          content: "Your appointment with Dr. Priya is confirmed for 09:30 AM next Monday.",
+        };
+      }
+    }
+  }
+
+  return {
+    content: "I'm CareSync's AI assistant. To book an appointment, try using one of the helper prompts on the right, like \"Book Dr. Ravi\".",
+  };
+}
+
 /**
  * Runs the conversational agent loop with tool-calling capabilities.
  * Resolves tool calls using the deterministic Appointment Engine.
@@ -157,45 +313,62 @@ Guidelines for conversation flow:
     history.unshift({ role: "system", content: systemPrompt });
   }
 
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  const isMock =
+    process.env.NODE_ENV !== "test" &&
+    (!apiKey || apiKey === "your_openrouter_api_key_here" || apiKey === "mock-key");
+
   let loopCount = 0;
   const maxLoops = 5;
 
   while (loopCount < maxLoops) {
     loopCount++;
     
-    // Fetch response from OpenRouter
-    const response = await client.chat.completions.create({
-      model: "x-ai/grok-2",
-      messages: history as unknown as Parameters<typeof client.chat.completions.create>[0]["messages"],
-      tools: agentTools,
-      temperature: 0
-    });
+    let choiceMessage: MockChoiceMessage;
 
-    const choiceMessage = response.choices[0]?.message;
-    if (!choiceMessage) {
-      throw new Error("No message returned from AI completions.");
+    if (isMock) {
+      // Offline fallback simulation
+      choiceMessage = simulateModelResponse(history);
+    } else {
+      // Fetch response from OpenRouter API
+      const response = await client.chat.completions.create({
+        model: "x-ai/grok-2",
+        messages: history as unknown as Parameters<typeof client.chat.completions.create>[0]["messages"],
+        tools: agentTools,
+        temperature: 0
+      });
+
+      const msg = response.choices[0]?.message;
+      if (!msg) {
+        throw new Error("No message returned from AI completions.");
+      }
+
+      choiceMessage = {
+        content: msg.content || null,
+        tool_calls: msg.tool_calls
+          ? msg.tool_calls.map((tc) => {
+              const funcCall = tc as {
+                id: string;
+                type: "function";
+                function: { name: string; arguments: string };
+              };
+              return {
+                id: funcCall.id,
+                type: "function" as const,
+                function: {
+                  name: funcCall.function.name,
+                  arguments: funcCall.function.arguments
+                }
+              };
+            })
+          : undefined
+      };
     }
 
     const assistantMessage: ChatMessage = {
       role: "assistant",
-      content: choiceMessage.content || null,
+      content: choiceMessage.content,
       tool_calls: choiceMessage.tool_calls
-        ? choiceMessage.tool_calls.map((tc) => {
-            const funcCall = tc as {
-              id: string;
-              type: "function";
-              function: { name: string; arguments: string };
-            };
-            return {
-              id: funcCall.id,
-              type: "function" as const,
-              function: {
-                name: funcCall.function.name,
-                arguments: funcCall.function.arguments
-              }
-            };
-          })
-        : undefined
     };
 
     history.push(assistantMessage);
