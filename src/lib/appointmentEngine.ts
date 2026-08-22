@@ -235,3 +235,32 @@ export function bookAppointment(request: AppointmentRequest): BookingResult {
     }
   };
 }
+
+/**
+ * Cancels a booked appointment slot, updating the database status back to available.
+ */
+export function cancelAppointment(request: AppointmentRequest): BookingResult {
+  // Validate request, requiring the exact time to cancel
+  validateRequest(request, true);
+  
+  // Perform cancellation (mutate state: isBooked = false)
+  const updated = updateSlotStatus(request.doctorName, request.date, request.time!, false);
+  
+  if (!updated) {
+    return {
+      success: false,
+      error: "Slot not found or could not be cancelled."
+    };
+  }
+  
+  return {
+    success: true,
+    booking: {
+      doctorName: request.doctorName,
+      date: request.date,
+      time: request.time!,
+      isBooked: false
+    }
+  };
+}
+
